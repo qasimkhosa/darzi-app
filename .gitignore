@@ -1,0 +1,31 @@
+node_modules/
+build/
+dist/
+coverage/
+.expo/
+.env.local
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Project-local links to shared ECC tooling; do not vendor the full catalog.
+.agents/skills/
+.codex/agents/
+
+# Native/build artifacts
+android/.gradle/
+android/.kotlin/
+android/build/
+android/app/build/
+android/app/.cxx/
+*.apk
+
+# Local device QA captures
+device-*.png
+darzi_*.png
+window*.xml
+device-logcat.txt
+
+# Supabase CLI local link/cache metadata
+supabase/.temp/
