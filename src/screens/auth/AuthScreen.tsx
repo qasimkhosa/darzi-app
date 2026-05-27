@@ -1,6 +1,6 @@
 import { FontAwesome, Ionicons } from '@expo/vector-icons';
 import { useNavigation } from '@react-navigation/native';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   KeyboardAvoidingView,
@@ -13,10 +13,23 @@ import {
 import { Screen } from '@/components/Screen';
 import { isSupabaseConfigured, supabase } from '@/lib/supabase';
 import { requestCurrentCoordinates, type Coordinates } from '@/utils/location';
-import { saveUserRole } from '@/utils/persistence';
+import {
+  clearPendingWhatsAppAuthChallenge,
+  loadPendingWhatsAppAuthChallenge,
+  savePendingWhatsAppAuthChallenge,
+  saveUserRole,
+  type PersistedWhatsAppAuthChallenge,
+} from '@/utils/persistence';
+import {
+  createRemoteWhatsAppAuthChallenge,
+  createWhatsAppAuthChallenge,
+  fetchRemoteWhatsAppAuthStatus,
+  isWhatsAppChallengeExpired,
+  openWhatsAppAuthMessage,
+} from '@/utils/whatsappAuth';
 import type { UserType } from '@/types/database';
 
-type AuthStep = 'sendOtp' | 'verifyOtp';
+type AuthStep = 'sendOtp' | 'verifyOtp' | 'whatsappPending';
 type AccountType = Extract<UserType, 'customer' | 'tailor'>;
 
 function normalizePakistanPhone(input: string) {
@@ -50,6 +63,10 @@ function getReadableAuthError(error: unknown) {
 
   if (message.toLowerCase().includes('token') || message.toLowerCase().includes('otp')) {
     return 'The verification code is invalid or expired. Please check the SMS and try again.';
+  }
+
+  if (message.toLowerCase().includes('whatsapp_auth_challenges')) {
+    return 'WhatsApp login storage is not deployed yet. Run the latest Supabase migration, then try again.';
   }
 
   return message || 'Authentication failed. Please try again.';
@@ -125,10 +142,14 @@ export function AuthScreen() {
   const [accountType, setAccountType] = useState<AccountType>('customer');
   const [phoneNumber, setPhoneNumber] = useState('+92');
   const [smsCode, setSmsCode] = useState('');
+  const [pendingWhatsAppChallenge, setPendingWhatsAppChallenge] =
+    useState<PersistedWhatsAppAuthChallenge | null>(null);
   const [tailorShopLocation, setTailorShopLocation] = useState<Coordinates | null>(null);
   const [errorMessage, setErrorMessage] = useState('');
+  const [infoMessage, setInfoMessage] = useState('');
   const [locationMessage, setLocationMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const [whatsappLoading, setWhatsappLoading] = useState(false);
   const [locationLoading, setLocationLoading] = useState(false);
 
   const normalizedPhoneNumber = useMemo(
@@ -138,6 +159,33 @@ export function AuthScreen() {
 
   const canSendOtp = normalizedPhoneNumber.length >= 12;
   const canVerifyOtp = smsCode.trim().length === 6;
+  const busy = loading || whatsappLoading;
+
+  useEffect(() => {
+    let active = true;
+
+    async function hydrateWhatsAppChallenge() {
+      const challenge = await loadPendingWhatsAppAuthChallenge();
+      if (!active || !challenge) return;
+
+      if (isWhatsAppChallengeExpired(challenge)) {
+        await clearPendingWhatsAppAuthChallenge();
+        return;
+      }
+
+      setPendingWhatsAppChallenge(challenge);
+      setPhoneNumber(challenge.phone);
+      setAccountType(challenge.accountType);
+      setAuthStep('whatsappPending');
+      setInfoMessage('You have a pending WhatsApp login request. Send the message, then check verification.');
+    }
+
+    void hydrateWhatsAppChallenge();
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const goToMainApp = () => {
     navigation.getParent()?.reset({
@@ -186,6 +234,7 @@ export function AuthScreen() {
 
   const handleSendOtp = async () => {
     setErrorMessage('');
+    setInfoMessage('');
 
     if (!canSendOtp) {
       setErrorMessage('Enter a valid mobile number, for example +923001234567.');
@@ -215,6 +264,7 @@ export function AuthScreen() {
 
   const handleVerifyOtp = async () => {
     setErrorMessage('');
+    setInfoMessage('');
 
     if (!canVerifyOtp) {
       setErrorMessage('Enter the 6-digit SMS code sent to your phone.');
@@ -254,11 +304,145 @@ export function AuthScreen() {
     }
   };
 
+  const handleStartWhatsAppLogin = async () => {
+    setErrorMessage('');
+    setInfoMessage('');
+
+    if (!canSendOtp) {
+      setErrorMessage('Enter a valid mobile number, for example +923001234567.');
+      return;
+    }
+
+    setWhatsappLoading(true);
+
+    try {
+      const challenge = createWhatsAppAuthChallenge(normalizedPhoneNumber, accountType);
+      const client = assertSupabaseClient();
+
+      await createRemoteWhatsAppAuthChallenge(client, challenge);
+      await savePendingWhatsAppAuthChallenge(challenge);
+      await openWhatsAppAuthMessage(challenge);
+
+      setPendingWhatsAppChallenge(challenge);
+      setPhoneNumber(challenge.phone);
+      setAuthStep('whatsappPending');
+      setInfoMessage('WhatsApp opened with your Darzi login code. Send the message, then return here.');
+    } catch (error) {
+      setErrorMessage(getReadableAuthError(error));
+    } finally {
+      setWhatsappLoading(false);
+    }
+  };
+
+  const handleReopenWhatsAppLogin = async () => {
+    if (!pendingWhatsAppChallenge) return;
+
+    setErrorMessage('');
+    setInfoMessage('');
+    setWhatsappLoading(true);
+
+    try {
+      await openWhatsAppAuthMessage(pendingWhatsAppChallenge);
+      setInfoMessage('WhatsApp opened again. Send the exact pre-filled message to continue.');
+    } catch (error) {
+      setErrorMessage(getReadableAuthError(error));
+    } finally {
+      setWhatsappLoading(false);
+    }
+  };
+
+  const handleCheckWhatsAppVerification = async () => {
+    setErrorMessage('');
+    setInfoMessage('');
+
+    if (!pendingWhatsAppChallenge) {
+      setErrorMessage('Start a WhatsApp login request first.');
+      setAuthStep('sendOtp');
+      return;
+    }
+
+    if (isWhatsAppChallengeExpired(pendingWhatsAppChallenge)) {
+      await clearPendingWhatsAppAuthChallenge();
+      setPendingWhatsAppChallenge(null);
+      setAuthStep('sendOtp');
+      setErrorMessage('That WhatsApp login code expired. Start a fresh WhatsApp login request.');
+      return;
+    }
+
+    setWhatsappLoading(true);
+
+    try {
+      const client = assertSupabaseClient();
+      const status = await fetchRemoteWhatsAppAuthStatus(client, pendingWhatsAppChallenge);
+
+      if (!status || status.status === 'pending') {
+        setInfoMessage('Still waiting for the Darzi WhatsApp webhook to verify this message.');
+        return;
+      }
+
+      if (status.status === 'expired') {
+        await clearPendingWhatsAppAuthChallenge();
+        setPendingWhatsAppChallenge(null);
+        setAuthStep('sendOtp');
+        setErrorMessage('That WhatsApp login code expired. Start a fresh request.');
+        return;
+      }
+
+      if (status.status === 'rejected') {
+        await clearPendingWhatsAppAuthChallenge();
+        setPendingWhatsAppChallenge(null);
+        setAuthStep('sendOtp');
+        setErrorMessage('WhatsApp verification was rejected. Please check the phone number and try again.');
+        return;
+      }
+
+      const { data, error } = await client.auth.signInAnonymously();
+
+      if (error) {
+        throw new Error(
+          'WhatsApp verified, but Supabase anonymous sign-in is not enabled yet. Enable Anonymous Sign-Ins or connect the verification Edge Function to issue a session.',
+        );
+      }
+
+      const userId = data?.user?.id ?? data?.session?.user?.id;
+      if (!userId) {
+        throw new Error('WhatsApp verified, but the app could not create a Supabase session.');
+      }
+
+      const signupLocation =
+        pendingWhatsAppChallenge.accountType === 'tailor'
+          ? tailorShopLocation ?? (await captureTailorShopLocation(false))
+          : null;
+
+      await initializeProfile(
+        userId,
+        status.phone,
+        pendingWhatsAppChallenge.accountType,
+        signupLocation,
+      );
+      await clearPendingWhatsAppAuthChallenge();
+      setPendingWhatsAppChallenge(null);
+      goToMainApp();
+    } catch (error) {
+      setErrorMessage(getReadableAuthError(error));
+    } finally {
+      setWhatsappLoading(false);
+    }
+  };
+
+  const handleUseSmsInstead = async () => {
+    setErrorMessage('');
+    setInfoMessage('');
+    await clearPendingWhatsAppAuthChallenge();
+    setPendingWhatsAppChallenge(null);
+    setAuthStep('sendOtp');
+  };
+
   return (
-    <Screen scroll={false}>
+    <Screen>
       <KeyboardAvoidingView
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-        className="flex-1 justify-center"
+        className="justify-center"
       >
         <View className="overflow-hidden rounded-[34px] bg-ink p-5 shadow-sm">
           <View className="absolute -right-20 -top-20 h-56 w-56 rounded-full bg-thread/50" />
@@ -270,12 +454,18 @@ export function AuthScreen() {
             Darzi Secure Login
           </Text>
           <Text className="mt-3 text-4xl font-black leading-[44px] text-white">
-            {authStep === 'sendOtp' ? 'Verify your phone' : 'Enter SMS code'}
+            {authStep === 'sendOtp'
+              ? 'Verify your phone'
+              : authStep === 'verifyOtp'
+                ? 'Enter SMS code'
+                : 'Send WhatsApp code'}
           </Text>
           <Text className="mt-3 text-base font-semibold leading-6 text-white/75">
             {authStep === 'sendOtp'
               ? 'Use your mobile number to access customer parchis, tailor dashboard, and cloud orders.'
-              : `We sent a 6-digit verification code to ${normalizedPhoneNumber}.`}
+              : authStep === 'verifyOtp'
+                ? `We sent a 6-digit verification code to ${normalizedPhoneNumber}.`
+                : 'Open WhatsApp, send your Darzi code to our business number, then return to verify.'}
           </Text>
         </View>
 
@@ -285,6 +475,15 @@ export function AuthScreen() {
               <Ionicons name="warning-outline" size={20} color="#dc2626" />
               <Text className="ml-2 flex-1 text-sm font-bold leading-5 text-red-700">
                 {errorMessage}
+              </Text>
+            </View>
+          ) : null}
+
+          {infoMessage ? (
+            <View className="mb-4 flex-row rounded-2xl bg-emerald-50 px-4 py-3">
+              <Ionicons name="information-circle-outline" size={20} color="#047857" />
+              <Text className="ml-2 flex-1 text-sm font-bold leading-5 text-emerald-800">
+                {infoMessage}
               </Text>
             </View>
           ) : null}
@@ -338,18 +537,34 @@ export function AuthScreen() {
               </View>
 
               <PrimaryButton
-                disabled={!canSendOtp || loading}
+                disabled={!canSendOtp || busy}
+                icon="logo-whatsapp"
+                label="Sign in with WhatsApp (Free)"
+                loading={whatsappLoading}
+                variant="whatsapp"
+                onPress={handleStartWhatsAppLogin}
+              />
+
+              <View className="mt-3 rounded-2xl bg-emerald-50 px-4 py-3">
+                <Text className="text-xs font-bold leading-5 text-emerald-800">
+                  This opens WhatsApp with a unique Darzi code. Because you send the first message,
+                  the login request uses Meta's customer-initiated service window instead of paid SMS.
+                </Text>
+              </View>
+
+              <PrimaryButton
+                disabled={!canSendOtp || busy}
                 icon="send-outline"
-                label="Send Verification Code"
+                label="Use SMS OTP Instead"
                 loading={loading}
                 onPress={handleSendOtp}
               />
 
               {__DEV__ ? (
-                <DemoButton disabled={loading} onPress={handleDemoLogin} />
+                <DemoButton disabled={busy} onPress={handleDemoLogin} />
               ) : null}
             </>
-          ) : (
+          ) : authStep === 'verifyOtp' ? (
             <>
               <View className="items-center rounded-[26px] bg-teal-50 px-5 py-5">
                 <View className="h-14 w-14 items-center justify-center rounded-2xl bg-white">
@@ -372,7 +587,7 @@ export function AuthScreen() {
               </View>
 
               <PrimaryButton
-                disabled={!canVerifyOtp || loading}
+                disabled={!canVerifyOtp || busy}
                 icon="checkmark-circle-outline"
                 label="Verify & Login"
                 loading={loading}
@@ -385,7 +600,7 @@ export function AuthScreen() {
                   setSmsCode('');
                   setErrorMessage('');
                 }}
-                disabled={loading}
+                disabled={busy}
                 className="mt-4 items-center rounded-2xl bg-slate-50 px-5 py-4"
                 accessibilityRole="button"
               >
@@ -393,9 +608,17 @@ export function AuthScreen() {
               </Pressable>
 
               {__DEV__ ? (
-                <DemoButton disabled={loading} onPress={handleDemoLogin} />
+                <DemoButton disabled={busy} onPress={handleDemoLogin} />
               ) : null}
             </>
+          ) : (
+            <WhatsAppPendingPanel
+              challenge={pendingWhatsAppChallenge}
+              loading={whatsappLoading}
+              onCheck={handleCheckWhatsAppVerification}
+              onOpen={handleReopenWhatsAppLogin}
+              onUseSms={handleUseSmsInstead}
+            />
           )}
         </View>
       </KeyboardAvoidingView>
@@ -480,6 +703,75 @@ function TailorLocationPermissionCard({
   );
 }
 
+function WhatsAppPendingPanel({
+  challenge,
+  loading,
+  onCheck,
+  onOpen,
+  onUseSms,
+}: {
+  challenge: PersistedWhatsAppAuthChallenge | null;
+  loading: boolean;
+  onCheck: () => void;
+  onOpen: () => void;
+  onUseSms: () => void;
+}) {
+  return (
+    <View>
+      <View className="items-center rounded-[26px] bg-emerald-50 px-5 py-5">
+        <View className="h-16 w-16 items-center justify-center rounded-2xl bg-white">
+          <FontAwesome name="whatsapp" size={34} color="#16a34a" />
+        </View>
+        <Text className="mt-3 text-sm font-black uppercase tracking-wide text-emerald-700">
+          WhatsApp Login Code
+        </Text>
+        <Text className="mt-2 text-4xl font-black tracking-[2px] text-ink">
+          {challenge?.challengeCode ?? 'DZ------'}
+        </Text>
+        <Text className="mt-3 text-center text-sm font-bold leading-5 text-slate-600">
+          Send the pre-filled WhatsApp message from {challenge?.phone ?? 'your phone'}.
+          Darzi will verify the inbound message through the WhatsApp Business webhook.
+        </Text>
+        {challenge ? (
+          <Text className="mt-3 rounded-full bg-white px-4 py-2 text-xs font-black text-emerald-700">
+            Expires {new Date(challenge.expiresAt).toLocaleTimeString([], {
+              hour: '2-digit',
+              minute: '2-digit',
+            })}
+          </Text>
+        ) : null}
+      </View>
+
+      <PrimaryButton
+        disabled={loading || !challenge}
+        icon="logo-whatsapp"
+        label="Open WhatsApp Again"
+        loading={false}
+        variant="whatsapp"
+        onPress={onOpen}
+      />
+
+      <PrimaryButton
+        disabled={loading || !challenge}
+        icon="refresh-outline"
+        label="I Sent It - Check Verification"
+        loading={loading}
+        onPress={onCheck}
+      />
+
+      <Pressable
+        onPress={onUseSms}
+        disabled={loading}
+        className="mt-4 items-center rounded-2xl bg-slate-50 px-5 py-4"
+        accessibilityRole="button"
+        accessibilityState={{ disabled: loading }}
+      >
+        <Text className="text-sm font-black text-slate-600">Use SMS OTP instead</Text>
+      </Pressable>
+    </View>
+  );
+}
+
 function AccountTypeButton({
   active,
   icon,
@@ -513,20 +805,24 @@ function PrimaryButton({
   icon,
   label,
   loading,
+  variant = 'primary',
   onPress,
 }: {
   disabled: boolean;
   icon: keyof typeof Ionicons.glyphMap;
   label: string;
   loading: boolean;
+  variant?: 'primary' | 'whatsapp';
   onPress: () => void;
 }) {
+  const enabledClassName = variant === 'whatsapp' ? 'bg-emerald-600' : 'bg-thread';
+
   return (
     <Pressable
       onPress={onPress}
       disabled={disabled}
       className={`mt-5 flex-row items-center justify-center rounded-2xl px-5 py-4 ${
-        disabled ? 'bg-slate-300' : 'bg-thread'
+        disabled ? 'bg-slate-300' : enabledClassName
       }`}
       accessibilityRole="button"
       accessibilityState={{ disabled }}

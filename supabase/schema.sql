@@ -79,6 +79,20 @@ create table if not exists public.posts (
 alter table public.posts
   add column if not exists owner_id uuid references public.profiles(id) on delete set null default auth.uid();
 
+create table if not exists public.whatsapp_auth_challenges (
+  id text primary key,
+  lookup_token text not null,
+  phone text not null,
+  user_type text not null check (user_type in ('customer', 'tailor')),
+  challenge_code text not null,
+  status text not null default 'pending' check (status in ('pending', 'verified', 'expired', 'rejected')),
+  auth_user_id uuid,
+  verification_note text,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  verified_at timestamptz
+);
+
 create index if not exists tailor_profiles_darzi_id_idx on public.tailor_profiles(darzi_id);
 create index if not exists tailor_profiles_expertise_tags_idx on public.tailor_profiles using gin(expertise_tags);
 create index if not exists orders_customer_id_idx on public.orders(customer_id);
@@ -88,6 +102,9 @@ create index if not exists orders_status_idx on public.orders(status);
 create index if not exists orders_created_at_idx on public.orders(created_at desc);
 create index if not exists posts_created_at_idx on public.posts(created_at desc);
 create index if not exists posts_darzi_id_idx on public.posts(darzi_id);
+create index if not exists whatsapp_auth_challenges_phone_idx on public.whatsapp_auth_challenges(phone);
+create index if not exists whatsapp_auth_challenges_challenge_code_idx on public.whatsapp_auth_challenges(challenge_code);
+create index if not exists whatsapp_auth_challenges_status_idx on public.whatsapp_auth_challenges(status);
 
 create or replace function public.touch_measurement_vault_updated_at()
 returns trigger
@@ -161,11 +178,51 @@ $$;
 
 grant execute on function public.increment_post_like_count(text, integer) to authenticated;
 
+create or replace function public.get_whatsapp_auth_challenge_status(
+  target_id text,
+  target_lookup_token text
+)
+returns table (
+  status text,
+  phone text,
+  user_type text,
+  verified_at timestamptz,
+  expires_at timestamptz
+)
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  update public.whatsapp_auth_challenges
+  set status = 'expired'
+  where id = target_id
+    and lookup_token = target_lookup_token
+    and status = 'pending'
+    and expires_at <= now();
+
+  return query
+  select
+    challenge.status,
+    challenge.phone,
+    challenge.user_type,
+    challenge.verified_at,
+    challenge.expires_at
+  from public.whatsapp_auth_challenges as challenge
+  where challenge.id = target_id
+    and challenge.lookup_token = target_lookup_token
+  limit 1;
+end;
+$$;
+
+grant execute on function public.get_whatsapp_auth_challenge_status(text, text) to anon, authenticated;
+
 alter table public.profiles enable row level security;
 alter table public.tailor_profiles enable row level security;
 alter table public.measurement_vault enable row level security;
 alter table public.orders enable row level security;
 alter table public.posts enable row level security;
+alter table public.whatsapp_auth_challenges enable row level security;
 
 drop policy if exists profiles_select_own_or_tailors on public.profiles;
 drop policy if exists profiles_select_authenticated on public.profiles;
@@ -302,6 +359,19 @@ create policy posts_update_owner_or_like_count
   on public.posts for update
   using (auth.role() = 'authenticated')
   with check (auth.role() = 'authenticated');
+
+drop policy if exists whatsapp_auth_challenges_insert_pending on public.whatsapp_auth_challenges;
+
+create policy whatsapp_auth_challenges_insert_pending
+  on public.whatsapp_auth_challenges for insert
+  with check (
+    status = 'pending'
+    and phone ~ '^\+[0-9]{10,15}$'
+    and expires_at > now()
+    and expires_at <= now() + interval '15 minutes'
+    and char_length(lookup_token) >= 24
+    and challenge_code ~ '^DZ-[A-Z0-9]{6}$'
+  );
 
 insert into public.profiles (id, user_type, full_name, phone)
 values ('00000000-0000-4000-8000-000000000433', 'tailor', 'Khan Tailors', '+920000000433')

@@ -46,6 +46,16 @@ export type PersistedReview = {
   createdAt: string;
 };
 
+export type PersistedWhatsAppAuthChallenge = {
+  id: string;
+  lookupToken: string;
+  challengeCode: string;
+  phone: string;
+  accountType: PersistedUserRole;
+  createdAt: string;
+  expiresAt: string;
+};
+
 const storageKeys = {
   localOrders: 'darzi.localOrders.v1',
   savedBookmarks: 'darzi.savedBookmarks.v1',
@@ -53,6 +63,7 @@ const storageKeys = {
   reviews: 'darzi.reviews.v1',
   userRole: 'darzi.userRole.v1',
   localLanguage: 'darzi.localLanguage.v1',
+  whatsappAuthChallenge: 'darzi.whatsappAuthChallenge.v1',
 } as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -122,6 +133,20 @@ function isPersistedReview(value: unknown): value is PersistedReview {
   );
 }
 
+function isPersistedWhatsAppAuthChallenge(value: unknown): value is PersistedWhatsAppAuthChallenge {
+  if (!isRecord(value)) return false;
+
+  return (
+    typeof value.id === 'string' &&
+    typeof value.lookupToken === 'string' &&
+    typeof value.challengeCode === 'string' &&
+    typeof value.phone === 'string' &&
+    (value.accountType === 'customer' || value.accountType === 'tailor') &&
+    typeof value.createdAt === 'string' &&
+    typeof value.expiresAt === 'string'
+  );
+}
+
 async function readJsonArray<T>(
   key: string,
   validator: (value: unknown) => value is T,
@@ -140,7 +165,31 @@ async function readJsonArray<T>(
   }
 }
 
+async function readJsonObject<T>(
+  key: string,
+  validator: (value: unknown) => value is T,
+): Promise<T | null> {
+  try {
+    const rawValue = await AsyncStorage.getItem(key);
+    if (!rawValue) return null;
+
+    const parsedValue: unknown = JSON.parse(rawValue);
+    return validator(parsedValue) ? parsedValue : null;
+  } catch (error) {
+    console.error(`[DarziPersistence] Failed to load ${key}`, error);
+    return null;
+  }
+}
+
 async function writeJsonArray<T>(key: string, value: T[]) {
+  try {
+    await AsyncStorage.setItem(key, JSON.stringify(value));
+  } catch (error) {
+    console.error(`[DarziPersistence] Failed to save ${key}`, error);
+  }
+}
+
+async function writeJsonObject<T>(key: string, value: T) {
   try {
     await AsyncStorage.setItem(key, JSON.stringify(value));
   } catch (error) {
@@ -211,6 +260,22 @@ export async function loadLocalReviews() {
   return readJsonArray(storageKeys.reviews, isPersistedReview);
 }
 
+export async function savePendingWhatsAppAuthChallenge(challenge: PersistedWhatsAppAuthChallenge) {
+  await writeJsonObject(storageKeys.whatsappAuthChallenge, challenge);
+}
+
+export async function loadPendingWhatsAppAuthChallenge() {
+  return readJsonObject(storageKeys.whatsappAuthChallenge, isPersistedWhatsAppAuthChallenge);
+}
+
+export async function clearPendingWhatsAppAuthChallenge() {
+  try {
+    await AsyncStorage.removeItem(storageKeys.whatsappAuthChallenge);
+  } catch (error) {
+    console.error('[DarziPersistence] Failed to clear WhatsApp auth challenge', error);
+  }
+}
+
 export async function saveUserRole(role: PersistedUserRole) {
   await writeSecureValue(storageKeys.userRole, role);
 }
@@ -246,6 +311,7 @@ export async function clearDarziLocalPersistence() {
       storageKeys.lookbookPosts,
       storageKeys.reviews,
       storageKeys.localLanguage,
+      storageKeys.whatsappAuthChallenge,
     ]);
     const secureStoreAvailable = await SecureStore.isAvailableAsync();
 

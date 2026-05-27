@@ -131,6 +131,55 @@ export type Database = {
           qr_code_str?: string | null;
         };
       };
+      whatsapp_auth_challenges: {
+        Row: {
+          id: string;
+          lookup_token: string;
+          phone: string;
+          user_type: UserType;
+          challenge_code: string;
+          status: 'pending' | 'verified' | 'expired' | 'rejected';
+          auth_user_id: string | null;
+          verification_note: string | null;
+          created_at: string;
+          expires_at: string;
+          verified_at: string | null;
+        };
+        Insert: {
+          id: string;
+          lookup_token: string;
+          phone: string;
+          user_type: UserType;
+          challenge_code: string;
+          status?: 'pending' | 'verified' | 'expired' | 'rejected';
+          auth_user_id?: string | null;
+          verification_note?: string | null;
+          created_at?: string;
+          expires_at: string;
+          verified_at?: string | null;
+        };
+        Update: {
+          status?: 'pending' | 'verified' | 'expired' | 'rejected';
+          auth_user_id?: string | null;
+          verification_note?: string | null;
+          verified_at?: string | null;
+        };
+      };
+    };
+    Functions: {
+      get_whatsapp_auth_challenge_status: {
+        Args: {
+          target_id: string;
+          target_lookup_token: string;
+        };
+        Returns: {
+          status: 'pending' | 'verified' | 'expired' | 'rejected';
+          phone: string;
+          user_type: UserType;
+          verified_at: string | null;
+          expires_at: string;
+        }[];
+      };
     };
   };
 };
